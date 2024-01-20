@@ -11,6 +11,7 @@ infer = "0.15"
 which = "5.0"
 elf = "0.7"
 anyhow = "1.0"
+shlex = "1.2"
 
 [profile.release]
 opt-level = 's'  # Optimize for size.

@@ -110,28 +110,49 @@ fn process_file(path: &Path) -> Result<Vec<PathBuf>> {
     let mut buffer = [0; 512];
     let bytes_read = file.read(&mut buffer)?;
     if let Some(shebang) = find_shebang(&buffer[0..bytes_read]) {
-        let (cmd, mut args) = {
-            let mut args = shebang.split_whitespace().collect::<VecDeque<_>>();
+        let (cmd, args) = {
+            let mut args = shlex::split(shebang).unwrap_or(vec![]);
             if args.is_empty() {
                 return Err(anyhow!("invalid shebang"));
             }
-            let cmd = args.pop_front().unwrap();
+            let cmd = args.remove(0);
             if args.is_empty() {
-                (cmd, VecDeque::new())
+                (cmd, vec![])
             } else {
                 (cmd, args)
             }
         };
-        files.push(PathBuf::from_str(cmd).unwrap());
+        files.push(PathBuf::from(cmd.clone()));
         if cmd == "/usr/bin/env" && !args.is_empty() {
             // handle special case
-            files.push(which::which(args.pop_front().unwrap())?);
+            // we need to find the command from the arguments
+            if let Some(cmd) = find_env_cmd(args.as_slice()) {
+                files.push(which::which(cmd)?);
+            }
         }
     } else if infer::app::is_elf(&buffer[0..bytes_read]) {
         assert_eq!(file.seek(SeekFrom::Start(0))?, 0);
         files.extend(parse_elf(file, path)?.into_iter())
     }
     Ok(files)
+}
+
+fn find_env_cmd(args: &[String]) -> Option<&String> {
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        if arg.starts_with('-') {
+            match arg.as_str() {
+                "-i" | "--ignore-environment" | "-0" | "--null" | "-v" | "--debug" => {}
+                "-u" | "--unset" | "-C" | "--chdir" | "-S" | "--split-string" if iter.len() > 0 => {
+                    iter.next(); // Skip the argument following the option
+                }
+                _ => continue, // Unrecognized or standalone options
+            }
+        } else if !arg.contains('=') {
+            return Some(arg); // Found COMMAND
+        }
+    }
+    None // No COMMAND found
 }
 
 fn parse_elf(file: File, path: &Path) -> Result<Vec<PathBuf>> {
