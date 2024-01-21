@@ -1,8 +1,12 @@
 use anyhow::{anyhow, Result};
 use elf::endian::{EndianParse, NativeEndian};
 use elf::ElfStream;
+use findshlibs::{IterationControl, SharedLibrary, TargetSharedLibrary};
 use path_absolutize::Absolutize;
-use std::collections::{HashMap, VecDeque};
+use regex::Regex;
+use std::cmp::Ordering;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::ffi::OsStr;
 use std::fs::{read_dir, read_link, File};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -12,6 +16,7 @@ use std::sync::OnceLock;
 use std::{env, fs};
 
 static DEFAULT_LDSO: OnceLock<PathBuf> = OnceLock::new();
+static GLIBC_VERSION_RE: OnceLock<Regex> = OnceLock::new();
 
 fn main() {
     {
@@ -163,9 +168,122 @@ fn parse_elf(file: File, path: &Path) -> Result<Vec<PathBuf>> {
         None => DEFAULT_LDSO.get().unwrap().to_path_buf(),
     };
     drop(file);
+    if let Some(file_name) = path.file_name().and_then(|f| f.to_str()) {
+        if file_name.starts_with("libc.so") || file_name.starts_with("libc-") {
+            // ok, this seems to be a libc
+            // find out if it's a glibc
+            if let Ok(glibc_version) = glibc_version(&path) {
+                files.extend(find_glibc_deps(&glibc_version)?);
+            }
+        }
+    }
     files.extend(find_elf_deps(&path, &ldso)?);
     files.push(ldso);
     Ok(files)
+}
+
+fn glibc_version(path: &Path) -> Result<Version> {
+    let output = Command::new(path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()?;
+
+    if !output.status.success() {
+        return Err(anyhow::anyhow!("glibc returned with non-success exit code"));
+    }
+
+    let output_str = String::from_utf8_lossy(&output.stdout);
+    let first_line = output_str
+        .lines()
+        .next()
+        .ok_or(anyhow::anyhow!("invalid output"))?;
+
+    let re = GLIBC_VERSION_RE
+        .get_or_init(|| Regex::new(r"(?i)^GNU C Library.*version (\d+\.\d+(?:\.\d+)?)").unwrap());
+
+    let captures = re
+        .captures(first_line)
+        .ok_or(anyhow::anyhow!("invalid output"))?;
+    let version_str = captures
+        .get(1)
+        .ok_or(anyhow::anyhow!("invalid output"))?
+        .as_str();
+
+    Version::from_str(version_str).map_err(|_| anyhow::anyhow!("invalid output"))
+}
+
+fn find_glibc_deps(version: &Version) -> Result<Vec<PathBuf>> {
+    let mut files = vec![];
+    if let Ok(Some(libgcc)) = find_dyn_lib("libgcc_s.so.1") {
+        files.push(libgcc);
+    }
+    if let Ok(Some(libidn2)) = find_dyn_lib("libidn2.so.0") {
+        files.push(libidn2);
+    }
+
+    let nss_conf = PathBuf::from_str("/etc/nsswitch.conf")?;
+    if nss_conf.is_file() {
+        for handler in parse_nsswitch_conf(&nss_conf)? {
+            let mut candidates = Vec::with_capacity(3);
+            if let Some(minor) = version.minor() {
+                candidates.push(format!(
+                    "libnss_{}-{}.{}.so",
+                    handler,
+                    version.major(),
+                    minor
+                ));
+            }
+            candidates.push(format!("libnss_{}.so.{}", handler, version.major()));
+            candidates.push(format!("libnss_{}.so", handler));
+            for lib in candidates {
+                if let Ok(Some(lib)) = find_dyn_lib(lib) {
+                    files.push(lib);
+                }
+            }
+        }
+        files.push(nss_conf);
+    }
+    Ok(files)
+}
+
+fn find_dyn_lib<S: AsRef<str>>(name: S) -> Result<Option<PathBuf>> {
+    let name = OsStr::new(name.as_ref());
+    let _lib = unsafe { libloading::os::unix::Library::new(name) }?;
+    let mut lib_path = None;
+    TargetSharedLibrary::each(|l| {
+        let path = PathBuf::from(l.name());
+        if path.file_name() == Some(name) {
+            lib_path = Some(path);
+            IterationControl::Break
+        } else {
+            IterationControl::Continue
+        }
+    });
+    Ok(lib_path)
+}
+
+fn parse_nsswitch_conf(path: &Path) -> Result<HashSet<String>> {
+    let file = File::open(path)?;
+    let reader = BufReader::new(file);
+
+    let mut handlers = HashSet::new();
+    for line in reader.lines() {
+        let line = line?;
+        // Split the line at a '#' character to ignore comments
+        let line = line.split('#').next().unwrap_or("");
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        for (i, part) in parts.iter().enumerate() {
+            // Skip the first part as it is the service name (e.g., "passwd:", "group:")
+            if i > 0 && !part.ends_with(':') {
+                let handler = part.split('[').next().unwrap(); // Split at '[' to ignore options
+                if !handler.is_empty() {
+                    handlers.insert(handler.to_string());
+                }
+            }
+        }
+    }
+
+    Ok(handlers)
 }
 
 fn find_ldso<E: EndianParse, S: std::io::Read + std::io::Seek>(
@@ -240,4 +358,58 @@ fn resolve_path<P1: AsRef<Path> + ?Sized, P2: AsRef<Path> + ?Sized>(
         .absolutize_from(reference.as_ref())
         .expect("unable to absolutize path")
         .to_path_buf()
+}
+
+#[derive(Debug, Eq)]
+struct Version(u64, Option<u64>, Option<u64>);
+
+impl Version {
+    fn major(&self) -> u64 {
+        self.0
+    }
+
+    fn minor(&self) -> Option<u64> {
+        self.1
+    }
+
+    #[allow(dead_code)]
+    fn revision(&self) -> Option<u64> {
+        self.2
+    }
+}
+
+impl PartialEq for Version {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0 && self.1 == other.1 && self.2 == other.2
+    }
+}
+
+impl PartialOrd for Version {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Version {
+    fn cmp(&self, other: &Self) -> Ordering {
+        match self.0.cmp(&other.0) {
+            Ordering::Equal => match self.1.unwrap_or(0).cmp(&other.1.unwrap_or(0)) {
+                Ordering::Equal => self.2.unwrap_or(0).cmp(&other.2.unwrap_or(0)),
+                other => other,
+            },
+            other => other,
+        }
+    }
+}
+
+impl FromStr for Version {
+    type Err = ();
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        let parts: Vec<&str> = s.split('.').collect();
+        let major = parts.get(0).ok_or(())?.parse::<u64>().map_err(|_| ())?;
+        let minor = parts.get(1).and_then(|s| s.parse::<u64>().ok());
+        let patch = parts.get(2).and_then(|s| s.parse::<u64>().ok());
+        Ok(Version(major, minor, patch))
+    }
 }
