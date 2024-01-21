@@ -1,12 +1,10 @@
 use anyhow::{anyhow, Result};
 use elf::endian::{EndianParse, NativeEndian};
 use elf::ElfStream;
-use findshlibs::{IterationControl, SharedLibrary, TargetSharedLibrary};
 use path_absolutize::Absolutize;
 use regex::Regex;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::ffi::OsStr;
 use std::fs::{read_dir, read_link, File};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -173,7 +171,7 @@ fn parse_elf(file: File, path: &Path) -> Result<Vec<PathBuf>> {
             // ok, this seems to be a libc
             // find out if it's a glibc
             if let Ok(glibc_version) = glibc_version(&path) {
-                files.extend(find_glibc_deps(&glibc_version)?);
+                files.extend(find_glibc_deps(&glibc_version, &path)?);
             }
         }
     }
@@ -212,12 +210,22 @@ fn glibc_version(path: &Path) -> Result<Version> {
     Version::from_str(version_str).map_err(|_| anyhow::anyhow!("invalid output"))
 }
 
-fn find_glibc_deps(version: &Version) -> Result<Vec<PathBuf>> {
+fn find_glibc_deps(version: &Version, path: &Path) -> Result<Vec<PathBuf>> {
+    let glibc_lib_dir = path.parent().unwrap();
+    fn find_lib<S: AsRef<str>>(dir: &Path, name: S) -> Option<PathBuf> {
+        let path = dir.join(name.as_ref());
+        if path.is_file() {
+            Some(path)
+        } else {
+            None
+        }
+    }
+
     let mut files = vec![];
-    if let Ok(Some(libgcc)) = find_dyn_lib("libgcc_s.so.1") {
+    if let Some(libgcc) = find_lib(glibc_lib_dir, "libgcc_s.so.1") {
         files.push(libgcc);
     }
-    if let Ok(Some(libidn2)) = find_dyn_lib("libidn2.so.0") {
+    if let Some(libidn2) = find_lib(glibc_lib_dir, "libidn2.so.0") {
         files.push(libidn2);
     }
 
@@ -236,7 +244,7 @@ fn find_glibc_deps(version: &Version) -> Result<Vec<PathBuf>> {
             candidates.push(format!("libnss_{}.so.{}", handler, version.major()));
             candidates.push(format!("libnss_{}.so", handler));
             for lib in candidates {
-                if let Ok(Some(lib)) = find_dyn_lib(lib) {
+                if let Some(lib) = find_lib(glibc_lib_dir, lib) {
                     files.push(lib);
                 }
             }
@@ -244,22 +252,6 @@ fn find_glibc_deps(version: &Version) -> Result<Vec<PathBuf>> {
         files.push(nss_conf);
     }
     Ok(files)
-}
-
-fn find_dyn_lib<S: AsRef<str>>(name: S) -> Result<Option<PathBuf>> {
-    let name = OsStr::new(name.as_ref());
-    let _lib = unsafe { libloading::os::unix::Library::new(name) }?;
-    let mut lib_path = None;
-    TargetSharedLibrary::each(|l| {
-        let path = PathBuf::from(l.name());
-        if path.file_name() == Some(name) {
-            lib_path = Some(path);
-            IterationControl::Break
-        } else {
-            IterationControl::Continue
-        }
-    });
-    Ok(lib_path)
 }
 
 fn parse_nsswitch_conf(path: &Path) -> Result<HashSet<String>> {
