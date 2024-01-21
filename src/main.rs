@@ -91,7 +91,13 @@ fn main() {
 fn process(path: &Path) -> Result<Vec<PathBuf>> {
     let metadata = fs::symlink_metadata(path)?;
     return if metadata.is_symlink() {
-        Ok(vec![read_link(path)?])
+        let mut link = read_link(path)?;
+        if path.is_dir() && !link.starts_with("/") {
+            // the symlink points to a directory and the link is relative
+            // need to prepend "../" to ensure the link points to the right destination
+            link = PathBuf::from_str("../")?.join(link);
+        }
+        Ok(vec![link])
     } else if metadata.is_dir() {
         Ok(read_dir(path)?
             .into_iter()
