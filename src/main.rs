@@ -83,7 +83,7 @@ fn main() {
             }
         })
         .collect::<Vec<_>>();
-    paths.sort_by(|a, b| a.len().cmp(&b.len()).then_with(|| a.cmp(b)));
+    paths.sort();
 
     for path in paths {
         println!("{}", path);
